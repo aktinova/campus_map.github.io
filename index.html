@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Карта ИрГАУ</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#6b7280; --accent:#2563eb; --a:#16a34a; --b:#dc2626; }
+  * { box-sizing: border-box; }
+  html, body { height:100%; overflow:hidden; }
+  body { display:flex; flex-direction:column; height:100dvh; margin:0; font:16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  header { flex:none; padding:10px 16px 0; }
+  h1 { font-size:18px; margin:0 0 8px; }
+  .panel { flex:none; display:grid; gap:8px; padding:0 16px 12px; grid-template-columns: 1fr; max-width:900px; }
+  @media (min-width:720px){ .panel { grid-template-columns: 1fr 1fr auto; align-items:end; } }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:2px; }
+  input { width:100%; padding:10px 12px; font-size:16px; border:1px solid #cfd4dc; border-radius:10px; background:var(--card); }
+  input:focus { outline:2px solid var(--accent); border-color:transparent; }
+  .btns { display:flex; gap:8px; }
+  button { padding:10px 14px; font-size:16px; border:0; border-radius:10px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:#e5e7eb; color:var(--ink); }
+  #msg { flex:none; padding:0 16px 6px; min-height:22px; color:var(--muted); font-size:14px; }
+  #msg.err { color:var(--b); }
+
+  /* шаги маршрута по этажам */
+  #steps { flex:none; display:flex; flex-wrap:wrap; align-items:center; gap:6px; padding:0 16px 8px; }
+  #steps:empty { display:none; }
+  #steps button { padding:6px 10px; font-size:13px; background:#e5e7eb; color:var(--ink); }
+  #steps button.on { background:var(--accent); color:#fff; }
+  #steps .arrow { color:var(--muted); }
+
+  .mapwrap { flex:1; min-height:0; position:relative; margin:0 8px 8px; background:var(--card); border-radius:12px; overflow:hidden; border:1px solid #e5e7eb; touch-action:none; }
+  svg#map { display:block; width:100%; height:100%; cursor:grab; }
+  .route { fill:none; stroke:var(--accent); stroke-width:7; stroke-linecap:round; stroke-linejoin:round;
+           stroke-dasharray:16 12; animation:flow .8s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset:-28; } }
+  .dbg-edge { stroke:#a855f7; stroke-width:1.5; opacity:.7; }
+  .dbg-node { fill:#a855f7; }
+  .dbg-room { fill:#f59e0b; }
+
+  /* переключатель этажей */
+  .floors { position:absolute; top:8px; right:8px; display:flex; gap:6px; }
+  .floors button { padding:6px 12px; font-size:14px; background:rgba(255,255,255,.92); color:var(--ink); border:1px solid #cfd4dc; }
+  .floors button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  .hint { position:absolute; left:8px; bottom:6px; margin:0; padding:4px 8px; border-radius:8px; background:rgba(255,255,255,.85); color:var(--muted); font-size:12px; }
+</style>
+</head>
+<body>
+<header><h1>Карта ИрГАУ</h1></header>
+
+<div class="panel">
+  <div><label for="from">Где вы сейчас</label>
+    <input id="from" list="places" placeholder="например, 223" autocomplete="off"></div>
+  <div><label for="to">Куда идти</label>
+    <input id="to" list="places" placeholder="например, 301" autocomplete="off"></div>
+  <div class="btns">
+    <button id="go">Построить</button>
+    <button id="swap" class="ghost" title="Поменять местами">⇄</button>
+    <button id="reset" class="ghost" title="Сбросить поиск и маршрут">✕ Сбросить</button>
+  </div>
+</div>
+<datalist id="places"></datalist>
+<div id="msg"></div>
+<div id="steps"></div>
+
+<div class="mapwrap">
+  <svg id="map" viewBox="0 790 1400 720" xmlns="http://www.w3.org/2000/svg">
+    <image id="plan" href="floor1.svg" width="1674" height="1532"/>
+    <g id="debug" style="display:none"></g>
+    <g id="routeG"></g>
+  </svg>
+  <div class="floors" id="floors"></div>
+  <p class="hint">
+    Колёсико мыши или щипок — масштаб, перетаскивание — сдвиг.
+    <a href="#" id="dbgToggle">Показать граф (отладка)</a>
+  </p>
+</div>
+
+<script>
+// --- калибровка по замеру: главный коридор 2 этажа, от кассы до начала столовой ---
+const CAL = { px: 572, steps: 105, sec: 60 };   // 572 px на плане = 105 шагов за 60 секунд
+const STEP_M = 0.7;                             // длина шага, м (прикидка; можно уточнить)
+const PX_PER_STEP = CAL.px / CAL.steps;         // сколько px плана в одном шаге
+const PX_PER_M = PX_PER_STEP / STEP_M;          // px плана в одном метре
+const STEPS_PER_SEC = CAL.steps / CAL.sec;      // темп ходьбы, шагов/с
+const FLOOR_SEC = 30;                           // секунд на смену этажа по лестнице
+
+const stepsOf = px => Math.max(1, Math.round(px / PX_PER_STEP));
+const fmtTime = sec => sec < 90 ? `около ${Math.max(10, Math.round(sec / 5) * 5)} с` : `около ${Math.round(sec / 60)} мин`;
+// Насколько маршрут «не любит» лестницы, задаётся в build_graph.py (FLOOR_COST).
+
+const $ = id => document.getElementById(id);
+const svg = $("map"), plan = $("plan"), routeG = $("routeG"), dbg = $("debug");
+const from = $("from"), to = $("to"), msg = $("msg"), floorsEl = $("floors"), stepsEl = $("steps");
+
+let G = null, adj = {}, searchable = [];
+let floors = [], floor = 1;       // список этажей и текущий этаж
+let homeFloor = 1;                // этаж с главным входом: на него возвращаемся при сбросе
+let route = null, here = null;   // найденный маршрут и точка «вы здесь» (из QR)
+let activeSeg = -1;               // какой отрезок маршрута (по этажам) сейчас в фокусе
+
+fetch("graph.json").then(r => r.json()).then(g => {
+  G = g;
+  for (const k in g.nodes) adj[k] = [];
+  for (const e of g.edges) {
+    const [a, b] = e, A = g.nodes[a], B = g.nodes[b];
+    // третье число в ребре — «стоимость» лестницы между этажами; иначе длина по координатам
+    const w = e.length > 2 ? e[2] : Math.hypot(A.x - B.x, A.y - B.y);
+    adj[a].push([b, w]); adj[b].push([a, w]);
+  }
+  floors = Object.keys(g.meta.floors).map(Number).sort((x, y) => x - y);
+  buildFloorButtons();
+  buildSearch();
+  // открываемся на этаже, где главный вход
+  const ent = Object.values(g.nodes).find(n => n.type === "entrance");
+  homeFloor = ent ? ent.floor : floors[0];
+  setFloor(homeFloor);
+  applyQuery();
+}).catch(err => {
+  console.error(err);
+  say("Не удалось загрузить graph.json. Откройте сайт через Live Server, а не двойным кликом.", true);
+});
+
+// ---------- этажи ----------
+function buildFloorButtons() {
+  floorsEl.innerHTML = floors.map(n => `<button data-f="${n}">${G.meta.floors[n].name}</button>`).join("");
+  floorsEl.querySelectorAll("button").forEach(b => b.onclick = () => setFloor(+b.dataset.f));
+}
+
+function setFloor(n, keepSeg) {
+  floor = n;
+  if (!keepSeg) activeSeg = route ? route.segs.findIndex(s => s.floor === n) : -1;
+  const F = G.meta.floors[n];
+  plan.setAttribute("href", F.svg);
+  plan.setAttribute("width", F.w); plan.setAttribute("height", F.h);
+  BOUNDS.x1 = F.w; MAX_W = F.w;    // у каждого этажа свой размер плана
+  if (typeof setVB === "function" && svg.getBoundingClientRect().width) setVB();
+  floorsEl.querySelectorAll("button").forEach(b => b.classList.toggle("on", +b.dataset.f === n));
+  stepsEl.querySelectorAll("button").forEach(b => b.classList.toggle("on", +b.dataset.i === activeSeg));
+  buildDebug();
+  drawRoute();
+}
+
+// ---------- поиск ----------
+function buildSearch() {
+  const dl = $("places");
+  searchable = Object.entries(G.nodes)
+    .filter(([, n]) => ["room", "entrance"].includes(n.type))
+    .map(([id, n]) => ({ id, label: n.label || id, hidden: WC_RE.test(id),   // отдельные туалеты в списке не показываем
+                         keys: [id, n.label || "", ...(n.aliases || [])].map(s => s.toLowerCase()) }));
+  // вместо десятков туалетов — два пункта; маршрут строится до ближайшего
+  for (const [g, G_] of Object.entries(WC_GROUPS))
+    searchable.push({ id: "group:" + g, label: G_.label, keys: G_.keys });
+  searchable.sort((a, b) => a.label.localeCompare(b.label, "ru", { numeric: true }));
+  dl.innerHTML = searchable.filter(s => !s.hidden).map(s => `<option value="${s.label}">`).join("");
+}
+
+const WC_RE = /_wc_[mf]_\d+$/;
+const WC_GROUPS = {
+  wc_f: { label: "Туалет женский", keys: ["туалет женский", "женский туалет", "туалет (жен.)", "туалет ж", "wc f"] },
+  wc_m: { label: "Туалет мужской", keys: ["туалет мужской", "мужской туалет", "туалет (муж.)", "туалет м", "wc m"] },
+};
+// все туалеты нужного типа на всех этажах
+const groupTargets = gid => Object.keys(G.nodes).filter(id => id.includes("_" + gid.slice(6) + "_") && WC_RE.test(id));
+
+function resolve(text) {
+  const t = text.trim().toLowerCase();
+  if (!t) return null;
+  const exact = searchable.find(s => s.keys.includes(t));
+  if (exact) return exact.id;
+  const part = searchable.filter(s => s.keys.some(k => k.startsWith(t)));
+  return part.length ? (part.find(s => !s.hidden) || part[0]).id : null;
+}
+
+// ---------- кратчайший путь (Дейкстра) ----------
+function dijkstra(src, dsts) {
+  const goal = dsts instanceof Set ? dsts : new Set([dsts]);   // можно искать ближайшую из нескольких целей
+  let dst = null;
+  const dist = { [src]: 0 }, prev = {}, done = new Set();
+  const pq = [[0, src]];
+  while (pq.length) {
+    pq.sort((a, b) => a[0] - b[0]);
+    const [d, u] = pq.shift();
+    if (done.has(u)) continue;
+    done.add(u);
+    if (goal.has(u)) { dst = u; break; }
+    for (const [v, w] of adj[u]) {
+      const nd = d + w;
+      if (nd < (dist[v] ?? Infinity)) { dist[v] = nd; prev[v] = u; pq.push([nd, v]); }
+    }
+  }
+  if (dst === null) return null;
+  const path = [dst];
+  while (path[0] !== src) path.unshift(prev[path[0]]);
+  return { path, dist: dist[dst] };
+}
+
+function say(t, err) { msg.textContent = t; msg.className = err ? "err" : ""; }
+
+// ---------- построение маршрута ----------
+const walkPx = ids => {
+  let s = 0;
+  for (let i = 1; i < ids.length; i++) {
+    const p = G.nodes[ids[i - 1]], q = G.nodes[ids[i]];
+    if (p.floor === q.floor) s += Math.hypot(p.x - q.x, p.y - q.y);   // переход между этажами длиной не считается
+  }
+  return s;
+};
+
+function splitByFloor(path) {
+  const segs = [];
+  for (const id of path) {
+    const f = G.nodes[id].floor, last = segs[segs.length - 1];
+    if (last && last.floor === f) last.ids.push(id); else segs.push({ floor: f, ids: [id] });
+  }
+  return segs;
+}
+
+function build() {
+  if (!G) return;
+  route = null; here = null; activeSeg = -1; stepsEl.innerHTML = "";
+  const a = resolve(from.value), b = resolve(to.value);
+  const fail = (t, err) => { drawRoute(); say(t, err); };
+  if (!a) return fail("Не нашёл «откуда»: " + (from.value || "поле пустое"), true);
+  if (!b) return fail("Не нашёл «куда»: " + (to.value || "поле пустое"), true);
+  if (String(a).startsWith("group:")) return fail("«Где вы сейчас» — укажите конкретное место аудиторию, а не «туалет».", true);
+  const isGroup = String(b).startsWith("group:");
+  const targets = isGroup ? new Set(groupTargets(b)) : null;
+  if (isGroup ? targets.has(a) : a === b) return fail("Вы уже на месте :)");
+  const r = dijkstra(a, isGroup ? targets : b);
+  if (!r) return fail("Маршрут не найден — граф в этом месте разорван.", true);
+
+  // этаж, который маршрут лишь «пролетает» по лестнице (с 1 на 3 через 2), отдельным шагом не показываем
+  const segs = splitByFloor(r.path).filter((s, i, all) => !(i > 0 && i < all.length - 1 && s.ids.length === 1));
+  route = { path: r.path, segs };
+
+  const px = walkPx(r.path), nSteps = stepsOf(px), m = Math.round(px / PX_PER_M);
+  const changes = r.path.filter((id, i) => i && G.nodes[id].floor !== G.nodes[r.path[i - 1]].floor).length;
+  const sec = nSteps / STEPS_PER_SEC + changes * FLOOR_SEC;
+  const moves = segs.slice(1).map((s, i) => `${s.floor > segs[i].floor ? "поднимитесь" : "спуститесь"} на ${s.floor} этаж`);
+  const destName = isGroup ? `${WC_GROUPS[b.slice(6)].label.toLowerCase()} (ближайший, ${G.nodes[r.path[r.path.length - 1]].floor} эт.)` : G.nodes[b].label;
+  say(`${G.nodes[a].label} → ${destName}: примерно ${nSteps} шагов (~${m} м), ${fmtTime(sec)} пешком` +
+      (moves.length ? ` · ${moves.join(", затем ")}` : ""));
+
+  if (segs.length > 1) {
+    stepsEl.innerHTML = segs.map((s, i) =>
+      `${i ? '<span class="arrow">›</span>' : ""}<button data-i="${i}">${G.meta.floors[s.floor].name} · ${stepsOf(walkPx(s.ids))} шагов</button>`
+    ).join("");
+    stepsEl.querySelectorAll("button").forEach(btn => btn.onclick = () => showSeg(+btn.dataset.i));
+  }
+  showSeg(0);
+}
+
+function showSeg(i) {
+  activeSeg = i;
+  setFloor(route.segs[i].floor, true);
+  fitTo(route.segs[i].ids.map(id => G.nodes[id]));
+}
+
+// ---------- отрисовка маршрута на текущем этаже ----------
+const badge = (p, text) => {
+  const w = text.length * 8.4 + 22;
+  return `<g transform="translate(${p.x},${p.y})"><circle r="9" fill="#f59e0b" stroke="#fff" stroke-width="3"/>` +
+         `<rect x="${-w / 2}" y="-44" width="${w}" height="24" rx="12" fill="#f59e0b"/>` +
+         `<text y="-32" text-anchor="middle" dominant-baseline="central" fill="#fff" font-size="15" font-weight="600" font-family="system-ui,sans-serif">${text}</text></g>`;
+};
+const dot = (p, color) => `<circle cx="${p.x}" cy="${p.y}" r="13" fill="${color}" stroke="#fff" stroke-width="4"/>`;
+
+function drawRoute() {
+  let h = "";
+  if (route) {
+    const { segs, path } = route;
+    segs.forEach((s, i) => {
+      if (s.floor !== floor) return;
+      const pts = s.ids.map(id => G.nodes[id]);
+      if (pts.length > 1) h += `<polyline class="route" points="${pts.map(p => `${p.x},${p.y}`).join(" ")}"/>`;
+      if (i > 0) h += badge(pts[0], `с ${segs[i - 1].floor} этажа`);
+      if (i < segs.length - 1) {
+        const t = segs[i + 1].floor;
+        h += badge(pts[pts.length - 1], `${t > s.floor ? "↑" : "↓"} на ${t} этаж`);
+      }
+    });
+    const A = G.nodes[path[0]], B = G.nodes[path[path.length - 1]];
+    if (A.floor === floor) h += dot(A, "#16a34a");
+    if (B.floor === floor) h += dot(B, "#dc2626");
+  } else if (here && G.nodes[here].floor === floor) {
+    h += dot(G.nodes[here], "#16a34a");
+  }
+  routeG.innerHTML = h;
+}
+
+// ---------- кнопки и поля ----------
+$("go").onclick = build;
+$("reset").onclick = () => {
+  from.value = ""; to.value = "";
+  route = null; here = null; activeSeg = -1;
+  stepsEl.innerHTML = ""; say("");
+  history.replaceState(null, "", location.pathname);   // убираем ?from=…&to=… из адреса
+  setFloor(homeFloor);
+  vb = { x: 0, y: 790, w: 1400, h: 720 };              // стартовый вид с главным коридором
+  setVB();
+  from.focus();
+};
+$("swap").onclick =() => { [from.value, to.value] = [to.value, from.value]; build(); };
+[from, to].forEach(el => el.addEventListener("keydown", e => { if (e.key === "Enter") build(); }));
+
+// QR: ?from=a301&to=a275  (только from — покажет «вы здесь» на нужном этаже)
+function applyQuery() {
+  const q = new URLSearchParams(location.search);
+  const f = q.get("from"), t = q.get("to");
+  if (f && G.nodes[f]) from.value = G.nodes[f].label || f;
+  if (t && G.nodes[t]) to.value = G.nodes[t].label || t;
+  if (f && t) build();
+  else if (f && G.nodes[f]) {
+    here = f;
+    setFloor(G.nodes[f].floor);
+    fitTo([G.nodes[f]], 420);
+  }
+}
+
+// ---------- отладка: показать граф текущего этажа ----------
+function buildDebug() {
+  let s = "";
+  for (const e of G.edges) {
+    const A = G.nodes[e[0]], B = G.nodes[e[1]];
+    if (A.floor !== floor || B.floor !== floor) continue;
+    s += `<line class="dbg-edge" x1="${A.x}" y1="${A.y}" x2="${B.x}" y2="${B.y}"/>`;
+  }
+  for (const [id, n] of Object.entries(G.nodes)) {
+    if (n.floor !== floor) continue;
+    s += `<circle class="${n.type === 'room' ? 'dbg-room' : 'dbg-node'}" cx="${n.x}" cy="${n.y}" r="${n.type === 'corridor' ? 3 : 5}"><title>${id}</title></circle>`;
+  }
+  dbg.innerHTML = s;
+}
+$("dbgToggle").onclick = e => {
+  e.preventDefault();
+  dbg.style.display = dbg.style.display === "none" ? "" : "none";
+};
+
+// ---------- масштаб и сдвиг ----------
+const MIN_W = 500;    // насколько можно приблизить (меньше число = ближе)
+let MAX_W = 1674;     // насколько можно отдалить (ставится по ширине плана этажа)
+const BOUNDS = { x0: 0, y0: 140, x1: 1674, y1: 1510 };   // за эти границы карту утащить нельзя
+let ASPECT = 720 / 1400;   // высота к ширине вида; считается из размеров окна (см. fitView)
+
+// стартовый вид: главный коридор (должен совпадать с viewBox в разметке)
+let vb = { x: 0, y: 790, w: 1400, h: 720 };
+
+function clampVB() {
+  vb.w = Math.min(MAX_W, Math.max(MIN_W, vb.w));
+  vb.h = vb.w * ASPECT;
+  const bw = BOUNDS.x1 - BOUNDS.x0, bh = BOUNDS.y1 - BOUNDS.y0;
+  vb.x = vb.w >= bw ? BOUNDS.x0 - (vb.w - bw) / 2
+                    : Math.min(BOUNDS.x1 - vb.w, Math.max(BOUNDS.x0, vb.x));
+  vb.y = vb.h >= bh ? BOUNDS.y0 - (vb.h - bh) / 2
+                    : Math.min(BOUNDS.y1 - vb.h, Math.max(BOUNDS.y0, vb.y));
+}
+const setVB = () => { clampVB(); svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`); };
+function fitView() {
+  const r = svg.getBoundingClientRect();
+  if (r.width > 0 && r.height > 0) ASPECT = r.height / r.width;
+  setVB();
+}
+function zoomAt(cx, cy, k) {
+  const nw = Math.min(MAX_W, Math.max(MIN_W, vb.w * k)), kk = nw / vb.w;
+  vb.x = cx - (cx - vb.x) * kk;
+  vb.y = cy - (cy - vb.y) * kk;
+  vb.w = nw;
+  setVB();
+}
+// показать на карте набор точек (маршрут на этаже) с небольшим запасом по краям
+function fitTo(pts, pad = 150) {
+  if (!pts.length) return;
+  const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+  const x0 = Math.min(...xs) - pad, x1 = Math.max(...xs) + pad;
+  const y0 = Math.min(...ys) - pad, y1 = Math.max(...ys) + pad;
+  vb.w = Math.max(x1 - x0, (y1 - y0) / ASPECT);
+  vb.x = (x0 + x1) / 2 - vb.w / 2;
+  vb.y = (y0 + y1) / 2 - vb.w * ASPECT / 2;
+  setVB();
+}
+window.addEventListener("resize", fitView);
+fitView();
+
+function toSvg(ev) { const r = svg.getBoundingClientRect(); return [vb.x + (ev.clientX - r.left) / r.width * vb.w, vb.y + (ev.clientY - r.top) / r.height * vb.h]; }
+svg.addEventListener("wheel", e => { e.preventDefault(); const [x, y] = toSvg(e); zoomAt(x, y, e.deltaY > 0 ? 1.15 : 1 / 1.15); }, { passive: false });
+const ptrs = new Map(); let lastDist = 0, drag = null;
+svg.addEventListener("pointerdown", e => { if (e.button === 1) e.preventDefault(); svg.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, e); drag = { x: e.clientX, y: e.clientY }; });
+svg.addEventListener("pointermove", e => {
+  if (!ptrs.has(e.pointerId)) return;
+  ptrs.set(e.pointerId, e);
+  const r = svg.getBoundingClientRect();
+  if (ptrs.size === 2) {
+    const [p, q] = [...ptrs.values()];
+    const d = Math.hypot(p.clientX - q.clientX, p.clientY - q.clientY);
+    if (lastDist) { const [x, y] = toSvg({ clientX: (p.clientX + q.clientX) / 2, clientY: (p.clientY + q.clientY) / 2 }); zoomAt(x, y, lastDist / d); }
+    lastDist = d; return;
+  }
+  if (drag) { vb.x -= (e.clientX - drag.x) / r.width * vb.w; vb.y -= (e.clientY - drag.y) / r.height * vb.h; drag = { x: e.clientX, y: e.clientY }; setVB(); }
+});
+const up = e => { ptrs.delete(e.pointerId); lastDist = 0; drag = ptrs.size ? drag : null; };
+svg.addEventListener("pointerup", up); svg.addEventListener("pointercancel", up);
+</script>
+</body>
+</html>
