@@ -1,0 +1,10 @@
+{
+  "name": "campus-map",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Карта вуза: сборка графа из SVG-планов этажей",
+  "scripts": {
+    "build": "node build_graph.js && node build_rooms.js",
+    "check": "node check_graph.js"
+  }
+}
